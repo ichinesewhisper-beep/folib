@@ -13,11 +13,17 @@ type IndexProgress struct {
 }
 
 type SearchReq struct {
-	Parent   string `json:"parent"`
-	Keywords string `json:"keywords"`
-	// 0 for all, 1 for dir, 2 for file
-	Scope int `json:"scope"`
-	PageReq
+    Parent   string `json:"parent"`
+    Keywords string `json:"keywords"`
+    // 0 for all, 1 for dir, 2 for file
+    Scope int `json:"scope"`
+    Exts []string `json:"exts"`
+    SizeMin int64 `json:"size_min"`
+    SizeMax int64 `json:"size_max"`
+    OrderBy string `json:"order_by"`
+    OrderDirection string `json:"order_direction"`
+    Distinct bool `json:"distinct"`
+    PageReq
 }
 
 type SearchNode struct {

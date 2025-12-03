@@ -1,25 +1,25 @@
 package search
 
 import (
-	"context"
-	"path"
-	"path/filepath"
-	"strings"
-	"sync"
-	"sync/atomic"
-	"time"
+    "context"
+    "path"
+    "runtime"
+    "strings"
+    "sync"
+    "sync/atomic"
+    "time"
 
-	"github.com/OpenListTeam/OpenList/v4/internal/conf"
-	"github.com/OpenListTeam/OpenList/v4/internal/errs"
-	"github.com/OpenListTeam/OpenList/v4/internal/fs"
-	"github.com/OpenListTeam/OpenList/v4/internal/model"
-	"github.com/OpenListTeam/OpenList/v4/internal/op"
-	"github.com/OpenListTeam/OpenList/v4/internal/search/searcher"
-	"github.com/OpenListTeam/OpenList/v4/internal/setting"
-	"github.com/OpenListTeam/OpenList/v4/pkg/mq"
-	"github.com/OpenListTeam/OpenList/v4/pkg/utils"
-	mapset "github.com/deckarep/golang-set/v2"
-	log "github.com/sirupsen/logrus"
+    "github.com/OpenListTeam/OpenList/v4/internal/conf"
+    "github.com/OpenListTeam/OpenList/v4/internal/errs"
+    "github.com/OpenListTeam/OpenList/v4/internal/fs"
+    "github.com/OpenListTeam/OpenList/v4/internal/model"
+    "github.com/OpenListTeam/OpenList/v4/internal/op"
+    "github.com/OpenListTeam/OpenList/v4/internal/search/searcher"
+    "github.com/OpenListTeam/OpenList/v4/internal/setting"
+    "github.com/OpenListTeam/OpenList/v4/pkg/mq"
+    "github.com/OpenListTeam/OpenList/v4/pkg/utils"
+    mapset "github.com/deckarep/golang-set/v2"
+    log "github.com/sirupsen/logrus"
 )
 
 var (
@@ -64,13 +64,13 @@ func BuildIndex(ctx context.Context, indexPaths, ignorePaths []string, maxDepth 
 			select {
 			case <-ticker.C:
 				tickCount += 1
-				if indexMQ.Len() < 1000 && tickCount != 5 {
-					continue
-				} else if tickCount >= 5 {
-					tickCount = 0
-				}
-				log.Infof("index obj count: %d", objCount)
-				indexMQ.ConsumeAll(func(messages []mq.Message[ObjWithParent]) {
+                if indexMQ.Len() < 10000 && tickCount != 3 {
+                    continue
+                } else if tickCount >= 3 {
+                    tickCount = 0
+                }
+                log.Infof("index obj count: %d", objCount)
+                indexMQ.ConsumeAll(func(messages []mq.Message[ObjWithParent]) {
 					if len(messages) != 0 {
 						log.Debugf("current index: %s", messages[len(messages)-1].Content.Parent)
 					}
@@ -137,54 +137,88 @@ func BuildIndex(ctx context.Context, indexPaths, ignorePaths []string, maxDepth 
 		}
 		wg.Wait()
 	}()
-	admin, err := op.GetAdmin()
-	if err != nil {
-		return err
-	}
 	if count {
 		WriteProgress(&model.IndexProgress{
 			ObjCount: 0,
 			IsDone:   false,
 		})
 	}
-	for _, indexPath := range indexPaths {
-		walkFn := func(indexPath string, info model.Obj) error {
-			if !running.Load() {
-				return filepath.SkipDir
-			}
-			for _, avoidPath := range ignorePaths {
-				if strings.HasPrefix(indexPath, avoidPath) {
-					return filepath.SkipDir
-				}
-			}
-			if storage, _, err := op.GetStorageAndActualPath(indexPath); err == nil {
-				if storage.GetStorage().DisableIndex {
-					return filepath.SkipDir
-				}
-			}
-			// ignore root
-			if indexPath == "/" {
-				return nil
-			}
-			indexMQ.Publish(mq.Message[ObjWithParent]{
-				Content: ObjWithParent{
-					Obj:    info,
-					Parent: path.Dir(indexPath),
-				},
-			})
-			return nil
-		}
-		fi, err = fs.Get(ctx, indexPath, &fs.GetArgs{})
-		if err != nil {
-			return err
-		}
-		// TODO: run walkFS concurrently
-		err = fs.WalkFS(context.WithValue(ctx, conf.UserKey, admin), maxDepth, indexPath, fi, walkFn)
-		if err != nil {
-			return err
-		}
-	}
-	return nil
+    for _, indexPath := range indexPaths {
+        fi, err = fs.Get(ctx, indexPath, &fs.GetArgs{})
+        if err != nil {
+            return err
+        }
+        type item struct{ p string; info model.Obj; depth int }
+        workCh := make(chan item, 1024)
+        tasks := &sync.WaitGroup{}
+        workers := runtime.NumCPU() * 8
+        wgw := &sync.WaitGroup{}
+        for i := 0; i < workers; i++ {
+            wgw.Add(1)
+            go func() {
+                defer wgw.Done()
+                for it := range workCh {
+                    if !running.Load() {
+                        tasks.Done()
+                        continue
+                    }
+                    skip := false
+                    for _, avoidPath := range ignorePaths {
+                        if strings.HasPrefix(it.p, avoidPath) {
+                            skip = true
+                            break
+                        }
+                    }
+                    if skip {
+                        tasks.Done()
+                        continue
+                    }
+                    if storage, _, err := op.GetStorageAndActualPath(it.p); err == nil {
+                        if storage.GetStorage().DisableIndex {
+                            tasks.Done()
+                            continue
+                        }
+                    }
+                    if it.p != "/" {
+                        indexMQ.Publish(mq.Message[ObjWithParent]{
+                            Content: ObjWithParent{Obj: it.info, Parent: path.Dir(it.p)},
+                        })
+                    }
+                    if !it.info.IsDir() || it.depth == 0 {
+                        tasks.Done()
+                        continue
+                    }
+                    meta, _ := op.GetNearestMeta(it.p)
+                    objs, err := fs.List(context.WithValue(ctx, conf.MetaKey, meta), it.p, &fs.ListArgs{})
+                    if err != nil {
+                        tasks.Done()
+                        continue
+                    }
+                    for _, o := range objs {
+                        if setting.GetBool(conf.IgnoreSystemFiles) && utils.IsSystemFile(o.GetName()) {
+                            continue
+                        }
+                        indexMQ.Publish(mq.Message[ObjWithParent]{
+                            Content: ObjWithParent{Obj: o, Parent: it.p},
+                        })
+                        if o.IsDir() && it.depth != 1 {
+                            tasks.Add(1)
+                            workCh <- item{p: path.Join(it.p, o.GetName()), info: o, depth: it.depth - 1}
+                        }
+                    }
+                    tasks.Done()
+                }
+            }()
+        }
+        tasks.Add(1)
+        workCh <- item{p: indexPath, info: fi, depth: maxDepth}
+        go func() {
+            tasks.Wait()
+            close(workCh)
+        }()
+        wgw.Wait()
+    }
+    return nil
 }
 
 func Del(ctx context.Context, prefix string) error {

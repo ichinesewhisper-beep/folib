@@ -33,6 +33,7 @@ type Manifest struct {
 }
 
 var static fs.FS
+var fallbackHTML string = "<!DOCTYPE html><html><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>OpenList</title><style>body{font-family:system-ui,Segoe UI,Arial;padding:24px}a{color:#1890ff;text-decoration:none}a:hover{text-decoration:underline}</style></head><body><h1>OpenList</h1><p>前端资源未配置或不可用。</p><p><a href=\"/search\">进入搜索页面</a></p></body></html>"
 
 func initStatic() {
 	utils.Log.Debug("Initializing static file system...")
@@ -58,35 +59,65 @@ func replaceStrings(content string, replacements map[string]string) string {
 
 func initIndex(siteConfig SiteConfig) {
 	utils.Log.Debug("Initializing index.html...")
-	// dist_dir is empty and cdn is not empty, and web_version is empty or beta or dev or rolling
 	if conf.Conf.DistDir == "" && conf.Conf.Cdn != "" && (conf.WebVersion == "" || conf.WebVersion == "beta" || conf.WebVersion == "dev" || conf.WebVersion == "rolling") {
-		utils.Log.Infof("Fetching index.html from CDN: %s/index.html...", siteConfig.Cdn)
-		resp, err := base.RestyClient.R().
-			SetHeader("Accept", "text/html").
-			Get(fmt.Sprintf("%s/index.html", siteConfig.Cdn))
-		if err != nil {
-			utils.Log.Fatalf("failed to fetch index.html from CDN: %v", err)
+		baseCdn := strings.TrimRight(siteConfig.Cdn, "/")
+		tryUrls := []string{fmt.Sprintf("%s/index.html", baseCdn)}
+		if !strings.HasSuffix(strings.ToLower(baseCdn), "/dist") {
+			tryUrls = append([]string{fmt.Sprintf("%s/dist/index.html", baseCdn)}, tryUrls...)
 		}
-		if resp.StatusCode() != http.StatusOK {
-			utils.Log.Fatalf("failed to fetch index.html from CDN, status code: %d", resp.StatusCode())
+		var ok bool
+		for _, u := range tryUrls {
+			utils.Log.Infof("Fetching index.html from CDN: %s...", u)
+			resp, err := base.RestyClient.R().
+				SetHeader("Accept", "text/html").
+				Get(u)
+			if err != nil {
+				utils.Log.Errorf("failed to fetch index.html from CDN: %v", err)
+				continue
+			}
+			if resp.StatusCode() != http.StatusOK {
+				utils.Log.Errorf("failed to fetch index.html from CDN, status code: %d", resp.StatusCode())
+				continue
+			}
+			body := string(resp.Body())
+			if strings.Contains(body, "Directory Tree") {
+				utils.Log.Warnf("CDN returned directory listing page for %s, trying next candidate", u)
+				continue
+			}
+			conf.RawIndexHtml = body
+			utils.Log.Infof("Successfully fetched index.html from CDN: %s", u)
+			ok = true
+			break
 		}
-		conf.RawIndexHtml = string(resp.Body())
-		utils.Log.Info("Successfully fetched index.html from CDN")
+		if !ok {
+			conf.RawIndexHtml = fallbackHTML
+			utils.Log.Warnf("all CDN candidates failed, using minimal fallback html")
+			UpdateIndex()
+			return
+		}
 	} else {
 		utils.Log.Debug("Reading index.html from static files system...")
 		indexFile, err := static.Open("index.html")
 		if err != nil {
 			if errors.Is(err, fs.ErrNotExist) {
-				utils.Log.Fatalf("index.html not exist, you may forget to put dist of frontend to public/dist")
+				conf.RawIndexHtml = fallbackHTML
+				utils.Log.Warnf("index.html not exist, using minimal fallback html")
+			} else {
+				conf.RawIndexHtml = fallbackHTML
+				utils.Log.Errorf("failed to read index.html: %v", err)
 			}
-			utils.Log.Fatalf("failed to read index.html: %v", err)
+			UpdateIndex()
+			return
 		}
 		defer func() {
 			_ = indexFile.Close()
 		}()
 		index, err := io.ReadAll(indexFile)
 		if err != nil {
-			utils.Log.Fatalf("failed to read dist/index.html")
+			conf.RawIndexHtml = fallbackHTML
+			utils.Log.Errorf("failed to read dist/index.html")
+			UpdateIndex()
+			return
 		}
 		conf.RawIndexHtml = string(index)
 		utils.Log.Debug("Successfully read index.html from static files system")
@@ -98,9 +129,9 @@ func initIndex(siteConfig SiteConfig) {
 		manifestPath = siteConfig.BasePath + "/manifest.json"
 	}
 	replaceMap := map[string]string{
-		"cdn: undefined":                    fmt.Sprintf("cdn: '%s'", siteConfig.Cdn),
-		"base_path: undefined":              fmt.Sprintf("base_path: '%s'", siteConfig.BasePath),
-		`href="/manifest.json"`:             fmt.Sprintf(`href="%s"`, manifestPath),
+		"cdn: undefined":        fmt.Sprintf("cdn: '%s'", siteConfig.Cdn),
+		"base_path: undefined":  fmt.Sprintf("base_path: '%s'", siteConfig.BasePath),
+		`href="/manifest.json"`: fmt.Sprintf(`href="%s"`, manifestPath),
 	}
 	conf.RawIndexHtml = replaceStrings(conf.RawIndexHtml, replaceMap)
 	UpdateIndex()
@@ -134,10 +165,10 @@ func UpdateIndex() {
 func ManifestJSON(c *gin.Context) {
 	// Get site configuration to ensure consistent base path handling
 	siteConfig := getSiteConfig()
-	
+
 	// Get site title from settings
 	siteTitle := setting.GetStr(conf.SiteTitle)
-	
+
 	// Get logo from settings, use the first line (light theme logo)
 	logoSetting := setting.GetStr(conf.Logo)
 	logoUrl := strings.Split(logoSetting, "\n")[0]
@@ -167,7 +198,7 @@ func ManifestJSON(c *gin.Context) {
 
 	c.Header("Content-Type", "application/json")
 	c.Header("Cache-Control", "public, max-age=3600") // cache for 1 hour
-	
+
 	if err := json.NewEncoder(c.Writer).Encode(manifest); err != nil {
 		utils.Log.Errorf("Failed to encode manifest.json: %v", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to generate manifest"})
@@ -181,7 +212,7 @@ func Static(r *gin.RouterGroup, noRoute func(handlers ...gin.HandlerFunc)) {
 	initStatic()
 	initIndex(siteConfig)
 	folders := []string{"assets", "images", "streamer", "static"}
-	
+
 	if conf.Conf.Cdn == "" {
 		utils.Log.Debug("Setting up static file serving...")
 		r.Use(func(c *gin.Context) {
@@ -194,7 +225,12 @@ func Static(r *gin.RouterGroup, noRoute func(handlers ...gin.HandlerFunc)) {
 		for _, folder := range folders {
 			sub, err := fs.Sub(static, folder)
 			if err != nil {
-				utils.Log.Fatalf("can't find folder: %s", folder)
+				if errors.Is(err, fs.ErrNotExist) {
+					utils.Log.Warnf("missing folder: %s, skipping route", folder)
+					continue
+				}
+				utils.Log.Errorf("failed to setup folder: %s: %v", folder, err)
+				continue
 			}
 			utils.Log.Debugf("Setting up route for folder: %s", folder)
 			r.StaticFS(fmt.Sprintf("/%s/", folder), http.FS(sub))

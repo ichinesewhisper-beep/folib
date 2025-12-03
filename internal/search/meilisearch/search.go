@@ -14,18 +14,19 @@ import (
 )
 
 type searchDocument struct {
-	// Document id, hash of the file path,
-	// can be used for filtering a file exactly(case-sensitively).
-	ID string `json:"id"`
-	// Hash of parent, can be used for filtering direct children.
-	ParentHash string `json:"parent_hash"`
-	// One-by-one hash of parent paths (path hierarchy).
-	// eg: A file's parent is '/home/a/b',
-	// its parent paths are '/home/a/b', '/home/a', '/home', '/'.
-	// Can be used for filtering all descendants exactly.
-	// Storing path hashes instead of plaintext paths benefits disk usage and case-sensitive filter.
-	ParentPathHashes []string `json:"parent_path_hashes"`
-	model.SearchNode
+    // Document id, hash of the file path,
+    // can be used for filtering a file exactly(case-sensitively).
+    ID string `json:"id"`
+    // Hash of parent, can be used for filtering direct children.
+    ParentHash string `json:"parent_hash"`
+    // One-by-one hash of parent paths (path hierarchy).
+    // eg: A file's parent is '/home/a/b',
+    // its parent paths are '/home/a/b', '/home/a', '/home', '/'.
+    // Can be used for filtering all descendants exactly.
+    // Storing path hashes instead of plaintext paths benefits disk usage and case-sensitive filter.
+    ParentPathHashes []string `json:"parent_path_hashes"`
+    Ext string `json:"ext"`
+    model.SearchNode
 }
 
 type Meilisearch struct {
@@ -41,23 +42,46 @@ func (m *Meilisearch) Config() searcher.Config {
 }
 
 func (m *Meilisearch) Search(ctx context.Context, req model.SearchReq) ([]model.SearchNode, int64, error) {
-	mReq := &meilisearch.SearchRequest{
-		AttributesToSearchOn: m.SearchableAttributes,
-		Page:                 int64(req.Page),
-		HitsPerPage:          int64(req.PerPage),
-	}
-	var filters []string
-	if req.Scope != 0 {
-		filters = append(filters, fmt.Sprintf("is_dir = %v", req.Scope == 1))
-	}
-	if req.Parent != "" && req.Parent != "/" {
-		// use parent_path_hashes to filter descendants
-		parentHash := hashPath(req.Parent)
-		filters = append(filters, fmt.Sprintf("parent_path_hashes = '%s'", parentHash))
-	}
-	if len(filters) > 0 {
-		mReq.Filter = strings.Join(filters, " AND ")
-	}
+    mReq := &meilisearch.SearchRequest{
+        AttributesToSearchOn: m.SearchableAttributes,
+        Page:                 int64(req.Page),
+        HitsPerPage:          int64(req.PerPage),
+    }
+    var filters []string
+    if req.Scope != 0 {
+        filters = append(filters, fmt.Sprintf("is_dir = %v", req.Scope == 1))
+    }
+    if req.Parent != "" && req.Parent != "/" {
+        // use parent_path_hashes to filter descendants
+        parentHash := hashPath(req.Parent)
+        filters = append(filters, fmt.Sprintf("parent_path_hashes = '%s'", parentHash))
+    }
+    if len(req.Exts) > 0 {
+        var es []string
+        for _, e := range req.Exts {
+            es = append(es, fmt.Sprintf("ext = '%s'", e))
+        }
+        filters = append(filters, fmt.Sprintf("(%s)", strings.Join(es, " OR ")))
+    }
+    if req.SizeMin > 0 {
+        filters = append(filters, fmt.Sprintf("size >= %d", req.SizeMin))
+    }
+    if req.SizeMax > 0 {
+        filters = append(filters, fmt.Sprintf("size <= %d", req.SizeMax))
+    }
+    if len(filters) > 0 {
+        mReq.Filter = strings.Join(filters, " AND ")
+    }
+    if req.OrderBy != "" {
+        dir := req.OrderDirection
+        if dir != "asc" && dir != "desc" {
+            dir = "asc"
+        }
+        switch req.OrderBy {
+        case "name", "size":
+            mReq.Sort = []string{fmt.Sprintf("%s:%s", req.OrderBy, dir)}
+        }
+    }
 
 	search, err := m.Client.Index(m.IndexUid).SearchWithContext(ctx, req.Keywords, mReq)
 	if err != nil {
@@ -83,25 +107,27 @@ func (m *Meilisearch) Index(ctx context.Context, node model.SearchNode) error {
 }
 
 func (m *Meilisearch) BatchIndex(ctx context.Context, nodes []model.SearchNode) error {
-	documents, err := utils.SliceConvert(nodes, func(src model.SearchNode) (*searchDocument, error) {
-		parentHash := hashPath(src.Parent)
-		nodePath := path.Join(src.Parent, src.Name)
-		nodePathHash := hashPath(nodePath)
-		parentPaths := utils.GetPathHierarchy(src.Parent)
-		parentPathHashes, err := utils.SliceConvert(parentPaths, func(parentPath string) (string, error) {
-			return hashPath(parentPath), nil
-		})
-		if err != nil {
-			return nil, err
-		}
+    documents, err := utils.SliceConvert(nodes, func(src model.SearchNode) (*searchDocument, error) {
+        parentHash := hashPath(src.Parent)
+        nodePath := path.Join(src.Parent, src.Name)
+        nodePathHash := hashPath(nodePath)
+        parentPaths := utils.GetPathHierarchy(src.Parent)
+        parentPathHashes, err := utils.SliceConvert(parentPaths, func(parentPath string) (string, error) {
+            return hashPath(parentPath), nil
+        })
+        if err != nil {
+            return nil, err
+        }
 
-		return &searchDocument{
-			ID:               nodePathHash,
-			ParentHash:       parentHash,
-			ParentPathHashes: parentPathHashes,
-			SearchNode:       src,
-		}, nil
-	})
+        ext := strings.ToLower(strings.TrimPrefix(path.Ext(src.Name), "."))
+        return &searchDocument{
+            ID:               nodePathHash,
+            ParentHash:       parentHash,
+            ParentPathHashes: parentPathHashes,
+            Ext:              ext,
+            SearchNode:       src,
+        }, nil
+    })
 	if err != nil {
 		return err
 	}

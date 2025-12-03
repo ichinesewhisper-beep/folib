@@ -28,11 +28,11 @@ func init() {
 				conf.Conf.Meilisearch.Host,
 				meilisearch.WithAPIKey(conf.Conf.Meilisearch.APIKey),
 			),
-			IndexUid: indexUid,
-			FilterableAttributes: []string{"parent", "is_dir", "name",
-				"parent_hash", "parent_path_hashes"},
-			SearchableAttributes: []string{"name"},
-		}
+            IndexUid: indexUid,
+            FilterableAttributes: []string{"parent", "is_dir", "name", "ext", "size",
+                "parent_hash", "parent_path_hashes"},
+            SearchableAttributes: []string{"name"},
+        }
 
 		_, err := m.Client.GetIndex(m.IndexUid)
 		if err != nil {
